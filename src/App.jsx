@@ -154,7 +154,7 @@ function App() {
       formData.append("profit_percentage", profit);
 
       const response = await fetch(
-        "http://127.0.0.1:5000/api/generate-excel",
+        `${import.meta.env.VITE_API_URL || "http://127.0.0.1:5000"}/api/generate-excel`,
         {
           method: "POST",
           body: formData,
