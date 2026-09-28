@@ -28,6 +28,7 @@ CORS(
                 "http://localhost:5174",
                 "http://127.0.0.1:5173",
                 "http://127.0.0.1:5174",
+                "https://pdf-excel-tool.vercel.app"
             ]
         }
     },
@@ -882,9 +883,9 @@ def generate_excel():
         # ====================================================
 
         print()
-        print("= - app.py:885" * 60)
-        print("PDF PROCESSING SUMMARY - app.py:886")
-        print("= - app.py:887" * 60)
+        print("= - app.py:886" * 60)
+        print("PDF PROCESSING SUMMARY - app.py:887")
+        print("= - app.py:888" * 60)
 
         print(
             f"Products extracted: {len(products)}"
@@ -939,7 +940,7 @@ def generate_excel():
             f"{gst_rate}%"
         )
 
-        print("= - app.py:942" * 60)
+        print("= - app.py:943" * 60)
 
         # ====================================================
         # FIRST PRODUCT CALCULATION CHECK
@@ -973,8 +974,8 @@ def generate_excel():
         )
 
         print()
-        print("FIRST PRODUCT CHECK - app.py:976")
-        print("= - app.py:977" * 60)
+        print("FIRST PRODUCT CHECK - app.py:977")
+        print("= - app.py:978" * 60)
 
         print(
             f"Product: "
@@ -1001,7 +1002,7 @@ def generate_excel():
             f"{first_default_mrp}"
         )
 
-        print("= - app.py:1004" * 60)
+        print("= - app.py:1005" * 60)
 
         # ====================================================
         # CREATE EXCEL
@@ -1077,9 +1078,9 @@ def generate_excel():
 if __name__ == "__main__":
 
     print()
-    print("= - app.py:1080" * 60)
-    print("PDF TO EXCEL BACKEND - app.py:1081")
-    print("= - app.py:1082" * 60)
+    print("= - app.py:1081" * 60)
+    print("PDF TO EXCEL BACKEND - app.py:1082")
+    print("= - app.py:1083" * 60)
 
     print(
         "Template:",
@@ -1091,7 +1092,7 @@ if __name__ == "__main__":
         "http://127.0.0.1:5000"
     )
 
-    print("= - app.py:1094" * 60)
+    print("= - app.py:1095" * 60)
 
     app.run(
         host="127.0.0.1",
