@@ -1,8 +1,12 @@
-from flask import Flask, jsonify, request, send_file
-from flask_cors import CORS
-from pypdf import PdfReader
-from openpyxl import load_workbook
 
+from flask import Flask, jsonify, request, send_file, after_this_request
+from flask_cors import CORS
+from openpyxl import load_workbook
+import fitz
+import pdfplumber
+import pytesseract
+from PIL import Image
+from io import BytesIO
 import os
 import re
 import tempfile
@@ -13,11 +17,7 @@ import tempfile
 # ============================================================
 
 app = Flask(__name__)
-
-
-# ============================================================
-# CORS
-# ============================================================
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 CORS(
     app,
@@ -28,7 +28,7 @@ CORS(
                 "http://localhost:5174",
                 "http://127.0.0.1:5173",
                 "http://127.0.0.1:5174",
-                "https://pdf-excel-tool.vercel.app"
+                "https://pdf-excel-tool.vercel.app",
             ]
         }
     },
@@ -36,20 +36,19 @@ CORS(
 
 
 # ============================================================
+# TESSERACT OCR CONFIGURATION
+# ============================================================
+
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+# ============================================================
 # FILE SETTINGS
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-TEMPLATE_PATH = os.path.join(
-    BASE_DIR,
-    "template.xlsx"
-)
-
-
-# ============================================================
-# NUMBER PATTERN
-# ============================================================
+TEMPLATE_PATH = os.path.join(BASE_DIR, "template.xlsx")
 
 NUMBER_PATTERN = r"\d+(?:,\d{3})*(?:\.\d+)?"
 
@@ -59,7 +58,7 @@ NUMBER_PATTERN = r"\d+(?:,\d{3})*(?:\.\d+)?"
 # ============================================================
 
 def clean_number(value):
-    """Convert text number into float."""
+    """Convert formatted numeric text into a float."""
 
     if value is None:
         return 0.0
@@ -67,7 +66,10 @@ def clean_number(value):
     value = str(value).strip()
     value = value.replace(",", "")
     value = value.replace("₹", "")
+    value = value.replace("Rs.", "")
+    value = value.replace("Rs", "")
     value = value.replace("%", "")
+    value = value.replace(" ", "")
 
     try:
         return float(value)
@@ -77,207 +79,347 @@ def clean_number(value):
 
 # ============================================================
 # EXTRACT PDF TEXT
+# Supports selectable text and scanned pages using OCR.
 # ============================================================
 
 def extract_pdf_text(pdf_path):
-    """Extract all text from PDF."""
+    """Extract text from a PDF, using OCR when needed."""
 
-    reader = PdfReader(pdf_path)
+    extracted_pages = []
 
-    pages = []
+    try:
+        with fitz.open(pdf_path) as pdf:
+            if len(pdf) == 0:
+                raise ValueError("The uploaded PDF has no pages.")
 
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages.append(text)
+            for page_number, page in enumerate(pdf, start=1):
+                text = page.get_text("text") or ""
 
-    return "\n".join(pages)
+                if len(text.strip()) < 30:
+                    try:
+                        pix = page.get_pixmap(
+                            matrix=fitz.Matrix(2, 2),
+                            alpha=False,
+                        )
+
+                        image = Image.open(
+                            BytesIO(pix.tobytes("png"))
+                        )
+
+                        ocr_text = pytesseract.image_to_string(
+                            image,
+                            config="--psm 3",
+                        )
+
+                        if len(ocr_text.strip()) > len(text.strip()):
+                            text = ocr_text
+
+                    except Exception as ocr_error:
+                        print(
+                            f"OCR error on page {page_number}:",
+                            ocr_error,
+                        )
+
+                extracted_pages.append(text)
+
+        result = "\n".join(extracted_pages)
+
+        if result.strip():
+            return result
+
+    except Exception as error:
+        print("PyMuPDF extraction error: - app.py:131", error)
+
+    # Fallback to pdfplumber and OCR.
+    try:
+        extracted_pages = []
+
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                raise ValueError("The uploaded PDF has no pages.")
+
+            for page_number, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text() or ""
+
+                if len(text.strip()) < 30:
+                    try:
+                        image = page.to_image(
+                            resolution=250
+                        ).original
+
+                        ocr_text = pytesseract.image_to_string(
+                            image,
+                            config="--psm 3",
+                        )
+
+                        if len(ocr_text.strip()) > len(text.strip()):
+                            text = ocr_text
+
+                    except Exception as ocr_error:
+                        print(
+                            f"Fallback OCR error on page {page_number}:",
+                            ocr_error,
+                        )
+
+                extracted_pages.append(text)
+
+        result = "\n".join(extracted_pages)
+
+        if result.strip():
+            return result
+
+    except Exception as error:
+        print("PDF fallback extraction error: - app.py:172", error)
+
+    raise ValueError(
+        "PDF se readable text nahi mila. "
+        "PDF ki validity, scan quality aur OCR installation check karein."
+    )
 
 
 # ============================================================
 # EXTRACT PRODUCTS
+# Supports numbered product rows and common unit names.
 # ============================================================
 
+
 def extract_products(text):
+    """Extract products from multiline and common invoice layouts."""
 
     products = []
+    lines = [" ".join(line.strip().split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
 
-    excluded_words = [
-        "PACKING",
-        "TRANSPORT",
-        "TRANSPORTATION",
-        "FREIGHT",
-        "ROUND OFF",
-        "ROUNDOFF",
-        "CGST",
-        "SGST",
-        "IGST",
-        "GRAND TOTAL",
-        "SUB TOTAL",
-        "SUBTOTAL",
-    ]
+    excluded_words = {
+        "ITEMS", "BOX", "PACKING", "TOTAL SET", "RATE",
+        "TOTAL RATE", "LOADING", "TRANSPORT", "TRANSPORTATION",
+        "FREIGHT", "ROUND OFF", "ROUNDOFF", "CGST", "SGST",
+        "IGST", "GRAND TOTAL", "SUB TOTAL", "SUBTOTAL",
+        "TAXABLE VALUE", "TOTAL TAX", "DISCOUNT TOTAL",
+        "INVOICE TOTAL", "NET AMOUNT", "NET PAYABLE",
+        "AMOUNT PAYABLE", "LESS 3 %", "LESS 3%",
+    }
 
-    for raw_line in text.splitlines():
+    def number_from_line(line):
+        """Return a number only when the whole line is numeric."""
+        value = line.strip()
+        value = re.sub(r"^(?:RS\.?|₹)\s*", "", value, flags=re.I)
+        value = value.replace(",", "")
+        value = value.replace("₹", "").strip()
+        value = re.sub(r"\s*%$", "", value)
 
-        line = " ".join(
-            raw_line.strip().split()
-        )
+        if not re.fullmatch(r"-?\d+(?:\.\d+)?", value):
+            return None
 
-        if not line:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    def is_footer_or_heading(line):
+        upper = line.upper().strip()
+
+        if upper in excluded_words:
+            return True
+
+        if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", line):
+            return True
+
+        if upper.startswith((
+            "TOTAL ", "GRAND TOTAL", "LESS ",
+            "RS GIFT", "GST ", "CGST", "SGST", "IGST"
+        )):
+            return True
+
+        return False
+
+    # --------------------------------------------------------
+    # FORMAT 1: MULTILINE INVOICE
+    # Product name followed by:
+    # Box, Packing, Total Set, Rate, Total Rate
+    # --------------------------------------------------------
+    header_index = -1
+
+    for i, line in enumerate(lines):
+        if line.strip().upper() == "TOTAL RATE":
+            header_index = i
+            break
+
+    start_index = header_index + 1 if header_index >= 0 else 0
+
+    for i in range(start_index, len(lines) - 5):
+        name = lines[i].strip()
+
+        # A product name must not itself be a numeric value.
+        if number_from_line(name) is not None:
             continue
 
-        upper_line = line.upper()
-
-        if any(
-            word in upper_line
-            for word in excluded_words
-        ):
+        if is_footer_or_heading(name):
             continue
 
-        # Product row starts like:
-        # 1. Product Name
+        # The next five lines should be numeric:
+        # Box, Packing, Total Set, Rate, Total Rate.
+        values = [
+            number_from_line(lines[i + offset])
+            for offset in range(1, 6)
+        ]
 
-        serial_match = re.match(
-            r"^(\d+)\.\s+(.+)$",
-            line
-        )
+        if any(value is None for value in values):
+            continue
+
+        box_count, packing, total_set, rate, amount = values
+
+        if box_count <= 0 or packing <= 0:
+            continue
+
+        if total_set <= 0 or rate <= 0 or amount <= 0:
+            continue
+
+        # Check that the extracted amount approximately matches
+        # quantity multiplied by unit rate.
+        expected_amount = total_set * rate
+        tolerance = max(2.0, expected_amount * 0.02)
+
+        if abs(expected_amount - amount) > tolerance:
+            continue
+
+        products.append({
+            "serial_no": len(products) + 1,
+            "name": name,
+            "qty": total_set,
+            "unit": "SET",
+            "list_price": rate,
+            "price": rate,
+            "amount": amount,
+        })
+
+        # Skip the five numeric lines already consumed.
+        # The loop advances one line at a time, so numeric lines
+        # cannot become product names because they are numeric.
+    
+    if products:
+        print("Multiline invoice products extracted:", len(products))
+        return products
+
+    # --------------------------------------------------------
+    # FORMAT 2: NUMBERED PRODUCT ROWS
+    # Example: 1 Product Name 12 PCS 100 80 960
+    # --------------------------------------------------------
+    unit_pattern = (
+        r"(SETS?|PCS?|PIECES?|BOX(?:ES)?|PKTS?|PACKETS?|"
+        r"DOZ(?:EN)?|KGS?|GMS?|GRAMS?|LTRS?|"
+        r"LIT(?:RE|ER)S?|ML|MTRS?|MET(?:RE|ER)S?|"
+        r"FT|FEET|INCH(?:ES)?|ROLLS?|BAGS?|PAIRS?|UNITS?)"
+    )
+
+    number_pattern = r"\d+(?:,\d{3})*(?:\.\d+)?"
+    seen_rows = set()
+
+    for line in lines:
+        if is_footer_or_heading(line):
+            continue
+
+        serial_match = re.match(r"^(\d{1,4})[.)]?\s+(.+)$", line)
 
         if not serial_match:
             continue
 
-        serial_no = int(
-            serial_match.group(1)
-        )
-
+        serial_no = int(serial_match.group(1))
         remaining = serial_match.group(2).strip()
 
-        # ----------------------------------------------------
-        # Quantity + Unit
-        # ----------------------------------------------------
-
         qty_match = re.search(
-            rf"({NUMBER_PATTERN})\s+([A-Za-z][A-Za-z.]*)",
-            remaining
+            rf"(?<![\w.])({number_pattern})\s+({unit_pattern})\b",
+            remaining,
+            re.IGNORECASE,
         )
 
         if not qty_match:
             continue
 
-        qty = clean_number(
-            qty_match.group(1)
-        )
-
-        unit = qty_match.group(2).strip()
+        qty = clean_number(qty_match.group(1))
+        unit = qty_match.group(2).upper()
 
         if qty <= 0:
             continue
 
-        product_name = remaining[
-            :qty_match.start()
-        ].strip()
+        name = remaining[:qty_match.start()].strip(" -:|")
 
-        if not product_name:
+        if not name:
             continue
 
-        # ----------------------------------------------------
-        # Numeric values after quantity and unit
-        # ----------------------------------------------------
-
-        numeric_text = remaining[
-            qty_match.end():
-        ]
-
-        numeric_values = [
+        numeric_text = remaining[qty_match.end():]
+        numbers = [
             clean_number(value)
-            for value in re.findall(
-                NUMBER_PATTERN,
-                numeric_text
-            )
+            for value in re.findall(number_pattern, numeric_text)
         ]
 
-        if len(numeric_values) < 3:
+        if len(numbers) < 3:
             continue
 
-        # ----------------------------------------------------
-        # Invoice structure
-        #
-        # First numeric = MRP
-        # Second-last = Unit Price
-        # Last = Amount
-        # ----------------------------------------------------
+        list_price = numbers[0]
+        price = numbers[-2]
+        amount = numbers[-1]
 
-        list_price = numeric_values[0]
-        price = numeric_values[-2]
-        amount = numeric_values[-1]
-
-        if list_price <= 0:
+        if price <= 0 or amount <= 0:
             continue
 
-        if price <= 0:
+        row_key = (name.upper(), qty, price, amount)
+
+        if row_key in seen_rows:
             continue
 
-        if amount <= 0:
-            continue
+        seen_rows.add(row_key)
 
-        products.append(
-            {
-                "serial_no": serial_no,
-                "name": product_name,
-                "qty": qty,
-                "unit": unit,
-                "list_price": list_price,
-                "price": price,
-                "amount": amount,
-            }
-        )
+        products.append({
+            "serial_no": serial_no,
+            "name": name,
+            "qty": qty,
+            "unit": unit,
+            "list_price": list_price,
+            "price": price,
+            "amount": amount,
+        })
 
+    print("Total products extracted:", len(products))
     return products
-
 
 # ============================================================
 # EXTRACT GRAND TOTAL
 # ============================================================
 
 def extract_grand_total(text):
+    total_labels = [
+        "GRAND TOTAL",
+        "INVOICE TOTAL",
+        "NET AMOUNT",
+        "NET PAYABLE",
+        "AMOUNT PAYABLE",
+    ]
 
     for raw_line in text.splitlines():
+        line = " ".join(raw_line.strip().split())
+        upper_line = line.upper()
 
-        line = " ".join(
-            raw_line.strip().split()
-        )
-
-        if "GRAND TOTAL" not in line.upper():
+        if not any(label in upper_line for label in total_labels):
             continue
 
         values = [
             clean_number(value)
-            for value in re.findall(
-                NUMBER_PATTERN,
-                line
-            )
+            for value in re.findall(NUMBER_PATTERN, line)
         ]
 
-        values = [
-            value
-            for value in values
-            if value > 0
-        ]
+        values = [value for value in values if value > 0]
 
-        if len(values) >= 2:
-            return max(values)
+        if values:
+            return values[-1]
 
-        if len(values) == 1:
-            return values[0]
-
-    # Fallback
+    # Fallback: add extracted product amounts.
     products = extract_products(text)
 
     if products:
         return round(
-            sum(
-                product["amount"]
-                for product in products
-            ),
-            2
+            sum(product["amount"] for product in products),
+            2,
         )
 
     return 0.0
@@ -288,76 +430,51 @@ def extract_grand_total(text):
 # ============================================================
 
 def extract_total_units(text):
+    total_labels = [
+        "GRAND TOTAL",
+        "TOTAL QTY",
+        "TOTAL QUANTITY",
+        "TOTAL UNITS",
+    ]
 
     for raw_line in text.splitlines():
+        line = " ".join(raw_line.strip().split())
+        upper_line = line.upper()
 
-        line = " ".join(
-            raw_line.strip().split()
-        )
-
-        if "GRAND TOTAL" not in line.upper():
+        if not any(label in upper_line for label in total_labels):
             continue
 
         values = [
             clean_number(value)
-            for value in re.findall(
-                NUMBER_PATTERN,
-                line
-            )
+            for value in re.findall(NUMBER_PATTERN, line)
         ]
 
-        values = [
-            value
-            for value in values
-            if value > 0
-        ]
+        values = [value for value in values if value > 0]
 
-        if len(values) >= 2:
+        if values:
+            # This is only an estimate for different invoice layouts.
             return min(values)
-
-        if len(values) == 1:
-            return values[0]
 
     return 0.0
 
 
 # ============================================================
-# EXTRA CHARGE PER PCS
+# EXTRA CHARGE PER UNIT
 # ============================================================
 
 def calculate_extra_charge_per_unit(
     total_extra_charge,
     unit_rate,
-    total_amount
+    total_amount,
 ):
-    """
-    Formula:
-
-    Extra Charge / PCS =
-    (TOTAL EXTRA CHARGE * 100 / TOTAL AMOUNT)
-    * UNIT RATE / 100
-
-    Equivalent to:
-
-    TOTAL EXTRA CHARGE * UNIT RATE / TOTAL AMOUNT
-    """
-
     if total_amount <= 0:
         return 0.0
 
     extra_charge_per_unit = (
-        (
-            total_extra_charge * 100
-        )
-        / total_amount
-    ) * (
-        unit_rate / 100
+        total_extra_charge * unit_rate / total_amount
     )
 
-    return round(
-        extra_charge_per_unit,
-        3
-    )
+    return round(extra_charge_per_unit, 3)
 
 
 # ============================================================
@@ -367,39 +484,13 @@ def calculate_extra_charge_per_unit(
 def calculate_selling_price(
     unit_price,
     extra_charge_per_unit,
-    profit_percentage
+    profit_percentage,
 ):
-    """
-    Cost Price =
-    Unit Price + Extra Charge / PCS
+    cost_price = unit_price + extra_charge_per_unit
+    profit_amount = cost_price * profit_percentage / 100
+    selling_price = cost_price + profit_amount
 
-    Profit =
-    Cost Price * Profit % / 100
-
-    Selling Price =
-    Cost Price + Profit
-    """
-
-    cost_price = (
-        unit_price
-        + extra_charge_per_unit
-    )
-
-    profit_amount = (
-        cost_price
-        * profit_percentage
-        / 100
-    )
-
-    selling_price = (
-        cost_price
-        + profit_amount
-    )
-
-    return round(
-        selling_price,
-        2
-    )
+    return round(selling_price, 2)
 
 
 # ============================================================
@@ -419,458 +510,24 @@ def create_excel(
     gst_amount,
     any_extra_charge,
     profit_percentage,
-    gst_rate
+    gst_rate,
 ):
-
-    if not os.path.exists(
-        TEMPLATE_PATH
-    ):
+    if not os.path.exists(TEMPLATE_PATH):
         raise FileNotFoundError(
-            "template.xlsx not found at: "
-            + TEMPLATE_PATH
+            "template.xlsx not found at: " + TEMPLATE_PATH
         )
 
-    # --------------------------------------------------------
-    # Load existing template
-    # --------------------------------------------------------
-
-    workbook = load_workbook(
-        TEMPLATE_PATH
-    )
-
-    if "Export Items" in workbook.sheetnames:
-        worksheet = workbook["Export Items"]
-    else:
-        worksheet = workbook.active
-
-    # --------------------------------------------------------
-    # Remove old data but keep header
-    # --------------------------------------------------------
-
-    if worksheet.max_row >= 2:
-
-        worksheet.delete_rows(
-            2,
-            worksheet.max_row - 1
-        )
-
-    # --------------------------------------------------------
-    # Total Extra Charge
-    # --------------------------------------------------------
-
-    total_extra_charge = (
-        transport_charge
-        + gst_amount
-        + any_extra_charge
-    )
-
-    # --------------------------------------------------------
-    # GST text
-    # --------------------------------------------------------
-
-    if gst_rate > 0:
-        tax_rate_text = f"GST@{gst_rate:g}%"
-    else:
-        tax_rate_text = "GST@0%"
-
-    # --------------------------------------------------------
-    # Add products
-    # --------------------------------------------------------
-
-    for product in products:
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # Formula uses UNIT RATE.
-        #
-        # Here Unit Rate = PDF Unit Price
-        # ----------------------------------------------------
-
-        unit_rate = product["price"]
-
-        extra_charge_per_unit = (
-            calculate_extra_charge_per_unit(
-                total_extra_charge,
-                unit_rate,
-                invoice_total
-            )
-        )
-
-        selling_price = (
-            calculate_selling_price(
-                unit_rate,
-                extra_charge_per_unit,
-                profit_percentage
-            )
-        )
-
-        # Default MRP = Selling Price x 2
-
-        default_mrp = round(
-            selling_price * 2,
-            2
-        )
-
-        row_number = (
-            worksheet.max_row + 1
-        )
-
-        # ----------------------------------------------------
-        # EXACT TEMPLATE A-O MAPPING
-        # ----------------------------------------------------
-
-        values = {
-
-            # A - Item name*
-            1: product["name"],
-
-            # B - Item code
-            2: item_code,
-
-            # C - Category
-            3: category,
-
-            # D - HSN
-            4: hsn,
-
-            # E - Default MRP
-            5: default_mrp,
-
-            # F - Sale price
-            6: selling_price,
-
-            # G - Purchase price
-            7: unit_rate,
-
-            # H - Opening stock quantity
-            8: product["qty"],
-
-            # I - Minimum stock quantity
-            9: minimum_stock,
-
-            # J - Item Location
-            10: item_location,
-
-            # K - Tax Rate
-            11: tax_rate_text,
-
-            # L - Inclusive Of Tax
-            12: "Inclusive",
-
-            # M - Base Unit (x)
-            13: product["unit"],
-
-            # N - Secondary Unit (y)
-            14: "",
-
-            # O - Conversion Rate (n)
-            15: "",
-        }
-
-        for column_number, value in values.items():
-
-            worksheet.cell(
-                row=row_number,
-                column=column_number,
-                value=value
-            )
-
-    # --------------------------------------------------------
-    # Save Excel
-    # --------------------------------------------------------
-
-    workbook.save(
-        output_path
-    )
-
-
-# ============================================================
-# HOME
-# ============================================================
-
-@app.route("/")
-def home():
-
-    return jsonify(
-        {
-            "success": True,
-            "message":
-                "PDF to Excel Import Tool API is running"
-        }
-    )
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.route(
-    "/api/health",
-    methods=["GET"]
-)
-def health():
-
-    return jsonify(
-        {
-            "success": True,
-            "status": "ok",
-            "message":
-                "PDF to Excel backend is running"
-        }
-    )
-
-
-# ============================================================
-# GENERATE EXCEL
-# ============================================================
-
-@app.route(
-    "/api/generate-excel",
-    methods=["POST"]
-)
-def generate_excel():
-
-    pdf_file = request.files.get("pdf")
-
-    if not pdf_file:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Please upload a PDF file."
-            }
-        ), 400
-
-    if not pdf_file.filename:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Invalid PDF filename."
-            }
-        ), 400
-
-    # ========================================================
-    # USER INPUTS
-    # ========================================================
-
-    item_code = request.form.get(
-        "item_code",
-        ""
-    ).strip()
-
-    category = request.form.get(
-        "category",
-        ""
-    ).strip()
-
-    hsn = request.form.get(
-        "hsn",
-        ""
-    ).strip()
-
-    item_location = request.form.get(
-        "item_location",
-        ""
-    ).strip()
-
-    minimum_stock = clean_number(
-        request.form.get(
-            "minimum_stock",
-            3
-        )
-    )
-
-    transport_charge = clean_number(
-        request.form.get(
-            "transport_charge",
-            0
-        )
-    )
-
-    gst_amount = clean_number(
-        request.form.get(
-            "gst_amount",
-            0
-        )
-    )
-
-    any_extra_charge = clean_number(
-        request.form.get(
-            "any_extra_charge",
-            0
-        )
-    )
-
-    profit_percentage = clean_number(
-        request.form.get(
-            "profit_percentage",
-            0
-        )
-    )
-
-    gst_rate = clean_number(
-        request.form.get(
-            "gst_rate",
-            0
-        )
-    )
-
-    # ========================================================
-    # BASIC VALIDATION
-    # ========================================================
-
-    if not item_code:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Item Code is required."
-            }
-        ), 400
-
-    if not category:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Category is required."
-            }
-        ), 400
-
-    if not hsn:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "HSN is required."
-            }
-        ), 400
-
-    if transport_charge < 0:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Transport Charge cannot be negative."
-            }
-        ), 400
-
-    if gst_amount < 0:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "GST Amount cannot be negative."
-            }
-        ), 400
-
-    if any_extra_charge < 0:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Any Extra Charge cannot be negative."
-            }
-        ), 400
-
-    if profit_percentage < 0:
-
-        return jsonify(
-            {
-                "success": False,
-                "error":
-                    "Profit Percentage cannot be negative."
-            }
-        ), 400
-
-    temp_pdf = None
+    workbook = load_workbook(TEMPLATE_PATH)
 
     try:
+        if "Export Items" in workbook.sheetnames:
+            worksheet = workbook["Export Items"]
+        else:
+            worksheet = workbook.active
 
-        # ====================================================
-        # SAVE TEMPORARY PDF
-        # ====================================================
-
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".pdf"
-        ) as temp_file:
-
-            pdf_file.save(
-                temp_file.name
-            )
-
-            temp_pdf = temp_file.name
-
-        # ====================================================
-        # EXTRACT PDF TEXT
-        # ====================================================
-
-        text = extract_pdf_text(
-            temp_pdf
-        )
-
-        # ====================================================
-        # EXTRACT PRODUCTS
-        # ====================================================
-
-        products = extract_products(
-            text
-        )
-
-        if not products:
-
-            return jsonify(
-                {
-                    "success": False,
-                    "error":
-                        "No product rows could be extracted from the PDF."
-                }
-            ), 400
-
-        # ====================================================
-        # EXTRACT INVOICE TOTAL
-        # ====================================================
-
-        total_amount = extract_grand_total(
-            text
-        )
-
-        if total_amount <= 0:
-
-            return jsonify(
-                {
-                    "success": False,
-                    "error":
-                        "Invoice total could not be detected from the PDF."
-                }
-            ), 400
-
-        # ====================================================
-        # TOTAL UNITS
-        # ====================================================
-
-        displayed_total_units = (
-            extract_total_units(text)
-        )
-
-        extracted_total_units = sum(
-            product["qty"]
-            for product in products
-        )
-
-        # ====================================================
-        # TOTAL EXTRA CHARGE
-        # ====================================================
+        # Keep the header and remove previous product rows.
+        if worksheet.max_row >= 2:
+            worksheet.delete_rows(2, worksheet.max_row - 1)
 
         total_extra_charge = (
             transport_charge
@@ -878,140 +535,319 @@ def generate_excel():
             + any_extra_charge
         )
 
-        # ====================================================
-        # PRINT SUMMARY
-        # ====================================================
+        tax_rate_text = f"GST@{gst_rate:g}%"
 
-        print()
-        print("= - app.py:886" * 60)
-        print("PDF PROCESSING SUMMARY - app.py:887")
-        print("= - app.py:888" * 60)
+        for product in products:
+            unit_rate = product["price"]
 
-        print(
-            f"Products extracted: {len(products)}"
+            extra_charge_per_unit = calculate_extra_charge_per_unit(
+                total_extra_charge,
+                unit_rate,
+                invoice_total,
+            )
+
+            selling_price = calculate_selling_price(
+                unit_rate,
+                extra_charge_per_unit,
+                profit_percentage,
+            )
+
+            # Default MRP = selling price x 2.
+            default_mrp = round(selling_price * 2, 2)
+
+            row_number = worksheet.max_row + 1
+
+            # Template columns A-O.
+            values = {
+                1: product["name"],       # A - Item name
+                2: item_code,             # B - Item code
+                3: category,              # C - Category
+                4: hsn,                   # D - HSN
+                5: default_mrp,           # E - Default MRP
+                6: selling_price,         # F - Sale price
+                7: unit_rate,             # G - Online Store Price / unit rate
+                8: product["qty"],        # H - Opening stock quantity
+                9: minimum_stock,         # I - Minimum stock quantity
+                10: item_location,        # J - Item Location
+                11: tax_rate_text,        # K - Tax Rate
+                12: "Inclusive",          # L - Inclusive Of Tax
+                13: product["unit"],      # M - Base Unit
+                14: "",                   # N - Secondary Unit
+                15: "",                   # O - Conversion Rate
+            }
+
+            for column_number, value in values.items():
+                worksheet.cell(
+                    row=row_number,
+                    column=column_number,
+                    value=value,
+                )
+
+        workbook.save(output_path)
+
+    finally:
+        workbook.close()
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "success": True,
+        "message": "PDF to Excel Import Tool API is running",
+    })
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({
+        "success": True,
+        "status": "ok",
+        "message": "PDF to Excel backend is running",
+    })
+
+
+# ============================================================
+# GENERATE EXCEL
+# ============================================================
+
+@app.route("/api/generate-excel", methods=["POST"])
+def generate_excel():
+    pdf_file = request.files.get("pdf")
+
+    if not pdf_file:
+        return jsonify({
+            "success": False,
+            "error": "Please upload a PDF file.",
+        }), 400
+
+    if not pdf_file.filename:
+        return jsonify({
+            "success": False,
+            "error": "Invalid PDF filename.",
+        }), 400
+
+    if not pdf_file.filename.lower().endswith(".pdf"):
+        return jsonify({
+            "success": False,
+            "error": "Please upload a PDF file.",
+        }), 400
+
+    # --------------------------------------------------------
+    # USER INPUTS
+    # --------------------------------------------------------
+
+    item_code = request.form.get("item_code", "").strip()
+    category = request.form.get("category", "").strip()
+    hsn = request.form.get("hsn", "").strip()
+    item_location = request.form.get("item_location", "").strip()
+
+    minimum_stock = clean_number(
+        request.form.get("minimum_stock", 3)
+    )
+
+    transport_charge = clean_number(
+        request.form.get("transport_charge", 0)
+    )
+
+    gst_amount = clean_number(
+        request.form.get("gst_amount", 0)
+    )
+
+    any_extra_charge = clean_number(
+        request.form.get("any_extra_charge", 0)
+    )
+
+    profit_percentage = clean_number(
+        request.form.get("profit_percentage", 0)
+    )
+
+    gst_rate = clean_number(
+        request.form.get("gst_rate", 0)
+    )
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    if not item_code:
+        return jsonify({
+            "success": False,
+            "error": "Item Code is required.",
+        }), 400
+
+    if not category:
+        return jsonify({
+            "success": False,
+            "error": "Category is required.",
+        }), 400
+
+    if not hsn:
+        return jsonify({
+            "success": False,
+            "error": "HSN is required.",
+        }), 400
+
+    numeric_inputs = [
+        minimum_stock,
+        transport_charge,
+        gst_amount,
+        any_extra_charge,
+        profit_percentage,
+        gst_rate,
+    ]
+
+    if any(value < 0 for value in numeric_inputs):
+        return jsonify({
+            "success": False,
+            "error": "Numeric inputs cannot be negative.",
+        }), 400
+
+    temp_pdf = None
+    output_path = None
+
+    try:
+        # ----------------------------------------------------
+        # SAVE TEMPORARY PDF
+        # ----------------------------------------------------
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".pdf",
+        ) as temp_file:
+            pdf_file.save(temp_file.name)
+            temp_pdf = temp_file.name
+
+        # ----------------------------------------------------
+        # EXTRACT TEXT
+        # ----------------------------------------------------
+
+        text = extract_pdf_text(temp_pdf)
+
+        print("\n - app.py:656" + "=" * 60)
+        print("PDF TEXT EXTRACTION - app.py:657")
+        print("= - app.py:658" * 60)
+        print(text[:5000])
+        print("= - app.py:660" * 60)
+
+        # ----------------------------------------------------
+        # EXTRACT PRODUCTS
+        # ----------------------------------------------------
+
+        products = extract_products(text)
+
+        if not products:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "No product rows could be extracted. "
+                    "This PDF may use a different invoice layout. "
+                    "Check the extracted text in the backend terminal."
+                ),
+            }), 400
+
+        # ----------------------------------------------------
+        # EXTRACT INVOICE TOTAL
+        # ----------------------------------------------------
+
+        total_amount = extract_grand_total(text)
+
+        if total_amount <= 0:
+            # Use product amounts if the invoice total is missing.
+            total_amount = round(
+                sum(product["amount"] for product in products),
+                2,
+            )
+
+        if total_amount <= 0:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "Invoice total could not be detected. "
+                    "Check the extracted text and invoice amounts."
+                ),
+            }), 400
+
+        displayed_total_units = extract_total_units(text)
+
+        extracted_total_units = sum(
+            product["qty"] for product in products
         )
 
-        print(
-            f"Invoice total: {total_amount}"
+        total_extra_charge = (
+            transport_charge
+            + gst_amount
+            + any_extra_charge
         )
 
+        # ----------------------------------------------------
+        # PROCESSING SUMMARY
+        # ----------------------------------------------------
+
+        print("\n - app.py:716" + "=" * 60)
+        print("PDF PROCESSING SUMMARY - app.py:717")
+        print("= - app.py:718" * 60)
+        print("Products extracted: - app.py:719", len(products))
+        print("Invoice total: - app.py:720", total_amount)
+        print("PDF displayed units: - app.py:721", displayed_total_units)
+        print("Extracted product units: - app.py:722", extracted_total_units)
         print(
-            f"PDF displayed units: "
-            f"{displayed_total_units}"
+            "Unit difference:",
+            displayed_total_units - extracted_total_units,
         )
+        print("Transport charge: - app.py:727", transport_charge)
+        print("GST amount: - app.py:728", gst_amount)
+        print("Any extra charge: - app.py:729", any_extra_charge)
+        print("Total extra charge: - app.py:730", total_extra_charge)
+        print("Profit percentage: - app.py:731", profit_percentage)
+        print("GST rate: - app.py:732", gst_rate)
+        print("= - app.py:733" * 60)
 
-        print(
-            f"Extracted product units: "
-            f"{extracted_total_units}"
-        )
-
-        print(
-            f"Unit difference: "
-            f"{displayed_total_units - extracted_total_units}"
-        )
-
-        print(
-            f"Transport charge: "
-            f"{transport_charge}"
-        )
-
-        print(
-            f"GST amount: "
-            f"{gst_amount}"
-        )
-
-        print(
-            f"Any extra charge: "
-            f"{any_extra_charge}"
-        )
-
-        print(
-            f"TOTAL EXTRA CHARGE: "
-            f"{total_extra_charge}"
-        )
-
-        print(
-            f"Profit percentage: "
-            f"{profit_percentage}%"
-        )
-
-        print(
-            f"GST rate: "
-            f"{gst_rate}%"
-        )
-
-        print("= - app.py:943" * 60)
-
-        # ====================================================
+        # ----------------------------------------------------
         # FIRST PRODUCT CALCULATION CHECK
-        # ====================================================
+        # ----------------------------------------------------
 
         first_product = products[0]
+        first_unit_rate = first_product["price"]
 
-        first_unit_rate = (
-            first_product["price"]
+        first_extra_per_unit = calculate_extra_charge_per_unit(
+            total_extra_charge,
+            first_unit_rate,
+            total_amount,
         )
 
-        first_extra_per_unit = (
-            calculate_extra_charge_per_unit(
-                total_extra_charge,
-                first_unit_rate,
-                total_amount
-            )
+        first_selling_price = calculate_selling_price(
+            first_unit_rate,
+            first_extra_per_unit,
+            profit_percentage,
         )
 
-        first_selling_price = (
-            calculate_selling_price(
-                first_unit_rate,
-                first_extra_per_unit,
-                profit_percentage
-            )
-        )
+        first_default_mrp = round(first_selling_price * 2, 2)
 
-        first_default_mrp = round(
-            first_selling_price * 2,
-            2
-        )
+        print("\nFIRST PRODUCT CHECK - app.py:756")
+        print("Product: - app.py:757", first_product["name"])
+        print("Unit price: - app.py:758", first_unit_rate)
+        print("Extra charge per unit: - app.py:759", first_extra_per_unit)
+        print("Selling price: - app.py:760", first_selling_price)
+        print("Default MRP: - app.py:761", first_default_mrp)
 
-        print()
-        print("FIRST PRODUCT CHECK - app.py:977")
-        print("= - app.py:978" * 60)
+        # ----------------------------------------------------
+        # CREATE A UNIQUE OUTPUT FILE
+        # ----------------------------------------------------
 
-        print(
-            f"Product: "
-            f"{first_product['name']}"
-        )
-
-        print(
-            f"Unit Price: "
-            f"{first_unit_rate}"
-        )
-
-        print(
-            f"Extra Charge/PCS: "
-            f"{first_extra_per_unit}"
-        )
-
-        print(
-            f"Selling Price: "
-            f"{first_selling_price}"
-        )
-
-        print(
-            f"Default MRP: "
-            f"{first_default_mrp}"
-        )
-
-        print("= - app.py:1005" * 60)
-
-        # ====================================================
-        # CREATE EXCEL
-        # ====================================================
-
-        output_path = os.path.join(
-            BASE_DIR,
-            "product_import.xlsx"
-        )
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".xlsx",
+            dir=BASE_DIR,
+        ) as output_file:
+            output_path = output_file.name
 
         create_excel(
             products=products,
@@ -1026,12 +862,24 @@ def generate_excel():
             gst_amount=gst_amount,
             any_extra_charge=any_extra_charge,
             profit_percentage=profit_percentage,
-            gst_rate=gst_rate
+            gst_rate=gst_rate,
         )
 
-        # ====================================================
-        # SEND EXCEL
-        # ====================================================
+        # Remove temporary files after the response is sent.
+        @after_this_request
+        def cleanup_files(response):
+            for path in (temp_pdf, output_path):
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except OSError as cleanup_error:
+                        print("Temporary file cleanup error: - app.py:798", cleanup_error)
+
+            return response
+
+        # ----------------------------------------------------
+        # SEND EXCEL FILE
+        # ----------------------------------------------------
 
         return send_file(
             output_path,
@@ -1040,35 +888,43 @@ def generate_excel():
             mimetype=(
                 "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"
-            )
+            ),
         )
 
     except Exception as exc:
+        print("ERROR: - app.py:817", str(exc))
 
-        print(
-            "ERROR:",
-            str(exc)
-        )
-
-        return jsonify(
-            {
-                "success": False,
-                "error": str(exc)
-            }
-        ), 500
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+        }), 500
 
     finally:
-
-        if (
-            temp_pdf
-            and os.path.exists(temp_pdf)
-        ):
-
+        if temp_pdf and os.path.exists(temp_pdf):
             try:
                 os.remove(temp_pdf)
-
             except OSError:
                 pass
+
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+
+@app.errorhandler(413)
+def file_too_large(error):
+    return jsonify({
+        "success": False,
+        "error": "PDF file 50 MB se chhoti honi chahiye.",
+    }), 413
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Server error. Backend terminal mein details check karein.",
+    }), 500
 
 
 # ============================================================
@@ -1076,26 +932,15 @@ def generate_excel():
 # ============================================================
 
 if __name__ == "__main__":
-
-    print()
-    print("= - app.py:1081" * 60)
-    print("PDF TO EXCEL BACKEND - app.py:1082")
-    print("= - app.py:1083" * 60)
-
-    print(
-        "Template:",
-        TEMPLATE_PATH
-    )
-
-    print(
-        "Server:",
-        "http://127.0.0.1:5000"
-    )
-
-    print("= - app.py:1095" * 60)
+    print("\n - app.py:857" + "=" * 60)
+    print("PDF TO EXCEL BACKEND - app.py:858")
+    print("= - app.py:859" * 60)
+    print("Template: - app.py:860", TEMPLATE_PATH)
+    print("Server: http://127.0.0.1:5000 - app.py:861")
+    print("= - app.py:862" * 60)
 
     app.run(
         host="127.0.0.1",
         port=5000,
-        debug=True
+        debug=True,
     )
