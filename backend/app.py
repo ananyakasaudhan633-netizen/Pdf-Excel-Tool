@@ -497,6 +497,7 @@ def calculate_selling_price(
 # CREATE EXCEL
 # ============================================================
 
+
 def create_excel(
     products,
     output_path,
@@ -525,7 +526,7 @@ def create_excel(
         else:
             worksheet = workbook.active
 
-        # Keep the header and remove previous product rows.
+        # Remove previous product rows, keep header.
         if worksheet.max_row >= 2:
             worksheet.delete_rows(2, worksheet.max_row - 1)
 
@@ -537,7 +538,20 @@ def create_excel(
 
         tax_rate_text = f"GST@{gst_rate:g}%"
 
-        for product in products:
+        
+# Read the starting item code, e.g. A1, A105, B25 or 500.
+base_code = str(item_code or "1").strip()
+match = re.fullmatch(r"([A-Za-z]*)(\d+)", base_code)
+
+if not match:
+    raise ValueError(
+        "Item Code mein A1, A105, B25 ya 500 jaisa code enter karein."
+    )
+
+code_prefix = match.group(1)
+start_number = int(match.group(2))
+
+        for index, product in enumerate(products, start=1):
             unit_rate = product["price"]
 
             extra_charge_per_unit = calculate_extra_charge_per_unit(
@@ -552,28 +566,34 @@ def create_excel(
                 profit_percentage,
             )
 
-            # Default MRP = selling price x 2.
             default_mrp = round(selling_price * 2, 2)
 
             row_number = worksheet.max_row + 1
 
-            # Template columns A-O.
+            # Example: ITEM001, ITEM002, ITEM003...
+            generated_code = f"{base_code}{index:03d}"
+
+         
+# Continue numbering from the user's starting code.
+unique_code = f"{code_prefix}{start_number + index - 1}"
+
+
             values = {
                 1: product["name"],       # A - Item name
-                2: item_code,             # B - Item code
-                3: category,              # C - Category
-                4: hsn,                   # D - HSN
-                5: default_mrp,           # E - Default MRP
-                6: selling_price,         # F - Sale price
-                7: unit_rate,             # G - Online Store Price / unit rate
-                8: product["qty"],        # H - Opening stock quantity
-                9: minimum_stock,         # I - Minimum stock quantity
-                10: item_location,        # J - Item Location
-                11: tax_rate_text,        # K - Tax Rate
-                12: "Inclusive",          # L - Inclusive Of Tax
-                13: product["unit"],      # M - Base Unit
-                14: "",                   # N - Secondary Unit
-                15: "",                   # O - Conversion Rate
+                2: unique_code,            # B - Unique item code
+                3: category,               # C - Category
+                4: hsn,                    # D - HSN
+                5: default_mrp,            # E - Default MRP
+                6: selling_price,          # F - Sale price
+                7: unit_rate,              # G - Online Store Price
+                8: product["qty"],         # H - Opening stock quantity
+                9: minimum_stock,          # I - Minimum stock
+                10: item_location,         # J - Item Location
+                11: tax_rate_text,         # K - Tax Rate
+                12: "Inclusive",           # L - Inclusive Of Tax
+                13: product["unit"],       # M - Base Unit
+                14: "",                    # N - Secondary Unit
+                15: "",                    # O - Conversion Rate
             }
 
             for column_number, value in values.items():
@@ -587,8 +607,6 @@ def create_excel(
 
     finally:
         workbook.close()
-
-
 # ============================================================
 # HOME
 # ============================================================
